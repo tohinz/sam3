@@ -138,12 +138,13 @@ def keep_largest_connected_component(mask: np.ndarray) -> np.ndarray:
 
 def find_separating_line(
     mask1: np.ndarray, mask2: np.ndarray
-) -> Tuple[float, float, float]:
+) -> Tuple[float, float, float, Dict]:
     """
     Find the optimal straight line that separates two masks.
 
-    The line maximizes the distance from the line to both masks, considering only
-    the part of each mask that is on its assigned side of the line.
+    Optimization priorities:
+    1. Minimize mask pixels on the wrong side of the line (misclassification)
+    2. Minimize line intersection with masks (maximize distance from line to masks)
 
     Line is represented in parametric form: x*cos(theta) + y*sin(theta) = rho
     where theta is the angle (0 to pi) and rho is the distance from origin.
@@ -153,10 +154,11 @@ def find_separating_line(
         mask2: Second binary mask [H, W] or [1, H, W]
 
     Returns:
-        Tuple of (theta, rho, score) where:
+        Tuple of (theta, rho, score, metrics_dict) where:
             - theta: angle of the line in radians (0 to pi)
             - rho: distance from origin
-            - score: optimization score (higher is better)
+            - score: optimization score (lower is better - represents total cost)
+            - metrics_dict: dictionary with detailed metrics
     """
     # Squeeze masks to 2D
     mask1_2d = (mask1.squeeze() > 0.5).astype(np.uint8)
@@ -170,18 +172,26 @@ def find_separating_line(
 
     if len(x1) == 0 or len(x2) == 0:
         print("Warning: One or both masks are empty")
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, {}
 
     # Compute centroids
     centroid1 = np.array([x1.mean(), y1.mean()])
     centroid2 = np.array([x2.mean(), y2.mean()])
 
+    # Total number of mask pixels
+    total_pixels1 = len(x1)
+    total_pixels2 = len(x2)
+
     def evaluate_line(params):
         """
         Evaluate the quality of a separating line.
 
-        Returns negative score (for minimization), where higher score means
-        the line is farther from both masks on their respective sides.
+        Returns cost (for minimization):
+        1. Primary: number of misclassified pixels (pixels on wrong side)
+        2. Secondary: negative minimum distance to masks (to maximize distance)
+
+        The cost is structured as: misclassified_pixels + 0.001 * (1.0 / min_distance)
+        This ensures misclassification is the dominant factor.
         """
         theta, rho = params
 
@@ -191,10 +201,10 @@ def find_separating_line(
 
         # Determine which side each centroid is on
         # Distance is signed: positive on one side, negative on the other
-        dist_centroid1 = x1.mean() * cos_theta + y1.mean() * sin_theta - rho
-        dist_centroid2 = x2.mean() * cos_theta + y2.mean() * sin_theta - rho
+        dist_centroid1 = centroid1[0] * cos_theta + centroid1[1] * sin_theta - rho
+        dist_centroid2 = centroid2[0] * cos_theta + centroid2[1] * sin_theta - rho
 
-        # If centroids are on the same side, this is a bad separation
+        # If centroids are on the same side, this is a very bad separation
         if dist_centroid1 * dist_centroid2 > 0:
             return 1e10  # Large penalty
 
@@ -202,38 +212,49 @@ def find_separating_line(
         distances1 = x1 * cos_theta + y1 * sin_theta - rho
         distances2 = x2 * cos_theta + y2 * sin_theta - rho
 
-        # For mask1, we only care about pixels on its assigned side (same sign as centroid)
-        # For mask2, we only care about pixels on its assigned side (same sign as centroid)
+        # Count misclassified pixels (pixels on the wrong side)
+        # Mask1 should be on the same side as centroid1
+        # Mask2 should be on the same side as centroid2
         if dist_centroid1 > 0:
-            # mask1 is on the positive side
-            relevant_distances1 = distances1[distances1 > 0]
-            relevant_distances2 = np.abs(distances2[distances2 < 0])
+            # mask1 should be on positive side, mask2 on negative side
+            misclassified1 = np.sum(distances1 <= 0)
+            misclassified2 = np.sum(distances2 >= 0)
+            # Get pixels on correct side for distance calculation
+            correct_distances1 = distances1[distances1 > 0]
+            correct_distances2 = np.abs(distances2[distances2 < 0])
         else:
-            # mask1 is on the negative side
-            relevant_distances1 = np.abs(distances1[distances1 < 0])
-            relevant_distances2 = distances2[distances2 > 0]
+            # mask1 should be on negative side, mask2 on positive side
+            misclassified1 = np.sum(distances1 >= 0)
+            misclassified2 = np.sum(distances2 <= 0)
+            # Get pixels on correct side for distance calculation
+            correct_distances1 = np.abs(distances1[distances1 < 0])
+            correct_distances2 = distances2[distances2 > 0]
 
-        # If any mask has pixels on the wrong side of the line
-        if len(relevant_distances1) == 0 or len(relevant_distances2) == 0:
-            return 1e10  # Large penalty
+        # Total misclassified pixels (PRIMARY CONSTRAINT)
+        total_misclassified = misclassified1 + misclassified2
 
-        # We want to maximize the minimum distance to each mask
-        # (considering only pixels on the correct side)
-        min_dist1 = np.min(relevant_distances1)
-        min_dist2 = np.min(relevant_distances2)
+        # Minimum distance to masks on correct side (SECONDARY CONSTRAINT)
+        # We want to maximize this, so we minimize 1/distance
+        if len(correct_distances1) > 0 and len(correct_distances2) > 0:
+            min_dist = min(np.min(correct_distances1), np.min(correct_distances2))
+            # Add a small epsilon to avoid division by zero
+            distance_cost = 1.0 / (min_dist + 0.1)
+        else:
+            # All pixels are misclassified - very bad
+            distance_cost = 1e6
 
-        # Score is the minimum of the two minimum distances
-        # We want to maximize this, so return negative for minimization
-        score = min(min_dist1, min_dist2)
+        # Combined cost: misclassification dominates, distance is secondary
+        # Scale factor of 0.001 ensures misclassification is ~1000x more important
+        cost = total_misclassified + 0.001 * distance_cost
 
-        return -score
+        return cost
 
     # Grid search for good initialization
     best_params = None
-    best_score = float("inf")
+    best_cost = float("inf")
 
     # Try different angles
-    num_angles = 36  # Every 5 degrees
+    num_angles = 72  # Every 2.5 degrees for finer search
     angles = np.linspace(0, np.pi, num_angles, endpoint=False)
 
     for theta in angles:
@@ -251,38 +272,81 @@ def find_separating_line(
         )
 
         # Try several rho values
-        num_rho = 10
+        num_rho = 20  # More samples for better initialization
         rhos = np.linspace(rho_min, rho_max, num_rho)
 
         for rho in rhos:
-            score = evaluate_line([theta, rho])
-            if score < best_score:
-                best_score = score
+            cost = evaluate_line([theta, rho])
+            if cost < best_cost:
+                best_cost = cost
                 best_params = [theta, rho]
 
     if best_params is None:
         print("Warning: Could not find initial separating line")
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, {}
 
     # Refine with local optimization
     result = minimize(
         evaluate_line,
         best_params,
         method="Nelder-Mead",
-        options={"xatol": 0.1, "fatol": 0.01, "maxiter": 200},
+        options={"xatol": 0.1, "fatol": 0.001, "maxiter": 500},
     )
 
     theta_opt, rho_opt = result.x
-    score_opt = -result.fun  # Convert back to positive score
+    cost_opt = result.fun
 
     # Normalize theta to [0, pi)
     theta_opt = theta_opt % np.pi
 
-    print(
-        f"  Optimal separating line: theta={np.degrees(theta_opt):.2f}°, rho={rho_opt:.2f}, score={score_opt:.2f}"
+    # Calculate final metrics for reporting
+    cos_theta = np.cos(theta_opt)
+    sin_theta = np.sin(theta_opt)
+
+    dist_centroid1 = centroid1[0] * cos_theta + centroid1[1] * sin_theta - rho_opt
+    dist_centroid2 = centroid2[0] * cos_theta + centroid2[1] * sin_theta - rho_opt
+
+    distances1 = x1 * cos_theta + y1 * sin_theta - rho_opt
+    distances2 = x2 * cos_theta + y2 * sin_theta - rho_opt
+
+    if dist_centroid1 > 0:
+        misclassified1 = np.sum(distances1 <= 0)
+        misclassified2 = np.sum(distances2 >= 0)
+        correct_distances1 = distances1[distances1 > 0]
+        correct_distances2 = np.abs(distances2[distances2 < 0])
+    else:
+        misclassified1 = np.sum(distances1 >= 0)
+        misclassified2 = np.sum(distances2 <= 0)
+        correct_distances1 = np.abs(distances1[distances1 < 0])
+        correct_distances2 = distances2[distances2 > 0]
+
+    total_misclassified = misclassified1 + misclassified2
+    min_dist = (
+        min(np.min(correct_distances1), np.min(correct_distances2))
+        if len(correct_distances1) > 0 and len(correct_distances2) > 0
+        else 0
     )
 
-    return theta_opt, rho_opt, score_opt
+    metrics = {
+        "misclassified_pixels": int(total_misclassified),
+        "misclassified_mask1": int(misclassified1),
+        "misclassified_mask2": int(misclassified2),
+        "misclassified_percent": float(
+            total_misclassified * 100.0 / (total_pixels1 + total_pixels2)
+        ),
+        "min_distance_to_masks": float(min_dist),
+        "total_cost": float(cost_opt),
+    }
+
+    print(
+        f"  Optimal separating line: theta={np.degrees(theta_opt):.2f}°, rho={rho_opt:.2f}"
+    )
+    print(
+        f"    Misclassified pixels: {total_misclassified} ({metrics['misclassified_percent']:.2f}%)"
+    )
+    print(f"    Min distance to masks: {min_dist:.2f} pixels")
+
+    return theta_opt, rho_opt, cost_opt, metrics
 
 
 def draw_line_on_image(
@@ -427,11 +491,14 @@ def visualize_masks(
             )
             axes[2].imshow(img_with_line)
 
+            # Build title with metrics
             title = f"Separating Line\n(angle={separating_line.get('theta_degrees', 0):.1f}°"
             if separating_line.get("is_default", False):
                 title += ", default)"
             else:
-                title += f", score={separating_line.get('score', 0):.2f})"
+                metrics = separating_line.get("metrics", {})
+                misclassified_pct = metrics.get("misclassified_percent", 0)
+                title += f", misclass={misclassified_pct:.1f}%)"
 
             axes[2].set_title(title, fontsize=14)
             axes[2].axis("off")
@@ -486,11 +553,14 @@ def visualize_masks(
                 )
                 axes[1].imshow(img_with_line)
 
+                # Build title with metrics
                 title = f"Separating Line\n(angle={separating_line.get('theta_degrees', 0):.1f}°"
                 if separating_line.get("is_default", False):
                     title += ", default)"
                 else:
-                    title += f", score={separating_line.get('score', 0):.2f})"
+                    metrics = separating_line.get("metrics", {})
+                    misclassified_pct = metrics.get("misclassified_percent", 0)
+                    title += f", misclass={misclassified_pct:.1f}%)"
 
                 axes[1].set_title(title, fontsize=14)
                 axes[1].axis("off")
@@ -614,12 +684,15 @@ def process_masks_for_image(
     # Find separating line if we have exactly 2 masks
     if len(cleaned_masks) == 2:
         print("  Finding optimal separating line...")
-        theta, rho, score = find_separating_line(cleaned_masks[0], cleaned_masks[1])
+        theta, rho, cost, metrics = find_separating_line(
+            cleaned_masks[0], cleaned_masks[1]
+        )
         result["separating_line"] = {
             "theta": theta,
             "rho": rho,
-            "score": score,
+            "cost": cost,
             "theta_degrees": np.degrees(theta),
+            "metrics": metrics,
         }
 
     print(f"  Image: {image_path}")

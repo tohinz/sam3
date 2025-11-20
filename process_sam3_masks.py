@@ -4,6 +4,7 @@ import hashlib
 import os
 from typing import Dict, List, Tuple
 
+import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import to_rgb
@@ -137,7 +138,10 @@ def keep_largest_connected_component(mask: np.ndarray) -> np.ndarray:
 
 
 def find_separating_line(
-    mask1: np.ndarray, mask2: np.ndarray
+    mask1: np.ndarray,
+    mask2: np.ndarray,
+    use_border_only: bool = True,
+    max_border_pixels: int = 2000,
 ) -> Tuple[float, float, float, Dict]:
     """
     Find the optimal straight line that separates two masks.
@@ -152,6 +156,8 @@ def find_separating_line(
     Args:
         mask1: First binary mask [H, W] or [1, H, W]
         mask2: Second binary mask [H, W] or [1, H, W]
+        use_border_only: If True, only use border pixels for distance calculations (much faster)
+        max_border_pixels: Maximum number of border pixels to use (subsample if more)
 
     Returns:
         Tuple of (theta, rho, score, metrics_dict) where:
@@ -166,21 +172,49 @@ def find_separating_line(
 
     h, w = mask1_2d.shape
 
-    # Get coordinates of mask pixels
-    y1, x1 = np.where(mask1_2d > 0)
-    y2, x2 = np.where(mask2_2d > 0)
+    # Get coordinates of ALL mask pixels (for final metrics)
+    y1_all, x1_all = np.where(mask1_2d > 0)
+    y2_all, x2_all = np.where(mask2_2d > 0)
 
-    if len(x1) == 0 or len(x2) == 0:
+    if len(x1_all) == 0 or len(x2_all) == 0:
         print("Warning: One or both masks are empty")
         return 0.0, 0.0, 0.0, {}
 
     # Compute centroids
-    centroid1 = np.array([x1.mean(), y1.mean()])
-    centroid2 = np.array([x2.mean(), y2.mean()])
+    centroid1 = np.array([x1_all.mean(), y1_all.mean()])
+    centroid2 = np.array([x2_all.mean(), y2_all.mean()])
 
-    # Total number of mask pixels
-    total_pixels1 = len(x1)
-    total_pixels2 = len(x2)
+    # Total number of mask pixels (for final metrics)
+    total_pixels1 = len(x1_all)
+    total_pixels2 = len(x2_all)
+
+    # Extract border pixels for optimization (much faster)
+    if use_border_only:
+        # Get border pixels using morphological erosion
+        # Border = original mask - eroded mask
+        kernel = np.ones((3, 3), np.uint8)
+        border1 = mask1_2d - cv2.erode(mask1_2d, kernel, iterations=1)
+        border2 = mask2_2d - cv2.erode(mask2_2d, kernel, iterations=1)
+
+        y1, x1 = np.where(border1 > 0)
+        y2, x2 = np.where(border2 > 0)
+
+        # Subsample if too many border pixels
+        if len(x1) > max_border_pixels:
+            indices = np.random.choice(len(x1), max_border_pixels, replace=False)
+            x1, y1 = x1[indices], y1[indices]
+        if len(x2) > max_border_pixels:
+            indices = np.random.choice(len(x2), max_border_pixels, replace=False)
+            x2, y2 = x2[indices], y2[indices]
+
+        print(
+            f"  Using border pixels: mask1={len(x1)}/{total_pixels1}, mask2={len(x2)}/{total_pixels2}"
+        )
+    else:
+        # Use all pixels (slower but more accurate)
+        x1, y1 = x1_all, y1_all
+        x2, y2 = x2_all, y2_all
+        print(f"  Using all pixels: mask1={len(x1)}, mask2={len(x2)}")
 
     def evaluate_line(params):
         """
@@ -249,34 +283,87 @@ def find_separating_line(
 
         return cost
 
-    # Grid search for good initialization
+    # OPTIMIZED: Vectorized grid search for good initialization
     best_params = None
     best_cost = float("inf")
 
-    # Try different angles
-    num_angles = 72  # Every 2.5 degrees for finer search
+    # Try different angles (reduced from 72 to 36 for 2x speedup with minimal accuracy loss)
+    num_angles = 36  # Every 5 degrees - good balance of speed and accuracy
     angles = np.linspace(0, np.pi, num_angles, endpoint=False)
 
-    for theta in angles:
-        cos_theta = np.cos(theta)
-        sin_theta = np.sin(theta)
+    # Precompute trigonometric values for all angles
+    cos_angles = np.cos(angles)
+    sin_angles = np.sin(angles)
 
-        # For this angle, try rho values between the two centroids
-        rho_min = min(
-            centroid1[0] * cos_theta + centroid1[1] * sin_theta,
-            centroid2[0] * cos_theta + centroid2[1] * sin_theta,
+    # Precompute centroid projections for all angles
+    # Shape: (num_angles,)
+    centroid1_proj = centroid1[0] * cos_angles + centroid1[1] * sin_angles
+    centroid2_proj = centroid2[0] * cos_angles + centroid2[1] * sin_angles
+
+    # For each angle, compute rho range
+    rho_mins = np.minimum(centroid1_proj, centroid2_proj)
+    rho_maxs = np.maximum(centroid1_proj, centroid2_proj)
+
+    # Try several rho values (reduced from 20 to 10 for 2x speedup)
+    num_rho = 10
+
+    # Vectorized evaluation for all angle-rho combinations
+    for i, theta in enumerate(angles):
+        # Generate rho values for this angle
+        rhos = np.linspace(rho_mins[i], rho_maxs[i], num_rho)
+
+        # Vectorized computation for all rho values at once
+        cos_theta = cos_angles[i]
+        sin_theta = sin_angles[i]
+
+        # Compute centroid distances (scalar for this theta)
+        dist_centroid1 = centroid1_proj[i] - rhos  # Shape: (num_rho,)
+        dist_centroid2 = centroid2_proj[i] - rhos  # Shape: (num_rho,)
+
+        # Filter out cases where centroids are on same side
+        valid_mask = dist_centroid1 * dist_centroid2 < 0
+
+        if not np.any(valid_mask):
+            continue
+
+        # Compute distances for all pixels (broadcast against rhos)
+        # distances shape: (num_pixels, num_rho)
+        distances1 = (
+            x1[:, np.newaxis] * cos_theta + y1[:, np.newaxis] * sin_theta - rhos
         )
-        rho_max = max(
-            centroid1[0] * cos_theta + centroid1[1] * sin_theta,
-            centroid2[0] * cos_theta + centroid2[1] * sin_theta,
+        distances2 = (
+            x2[:, np.newaxis] * cos_theta + y2[:, np.newaxis] * sin_theta - rhos
         )
 
-        # Try several rho values
-        num_rho = 20  # More samples for better initialization
-        rhos = np.linspace(rho_min, rho_max, num_rho)
+        # Vectorized misclassification counting for all valid rhos
+        for j, rho in enumerate(rhos):
+            if not valid_mask[j]:
+                continue
 
-        for rho in rhos:
-            cost = evaluate_line([theta, rho])
+            dist1 = distances1[:, j]
+            dist2 = distances2[:, j]
+
+            if dist_centroid1[j] > 0:
+                misclassified1 = np.sum(dist1 <= 0)
+                misclassified2 = np.sum(dist2 >= 0)
+                correct_dist1 = dist1[dist1 > 0]
+                correct_dist2 = np.abs(dist2[dist2 < 0])
+            else:
+                misclassified1 = np.sum(dist1 >= 0)
+                misclassified2 = np.sum(dist2 <= 0)
+                correct_dist1 = np.abs(dist1[dist1 < 0])
+                correct_dist2 = dist2[dist2 > 0]
+
+            total_misclassified = misclassified1 + misclassified2
+
+            if len(correct_dist1) > 0 and len(correct_dist2) > 0:
+                min_dist = min(np.min(correct_dist1), np.min(correct_dist2))
+                distance_cost = 1.0 / (min_dist + 0.1)
+            else:
+                distance_cost = 1e6
+
+            cost = total_misclassified + 0.001 * distance_cost
+
             if cost < best_cost:
                 best_cost = cost
                 best_params = [theta, rho]

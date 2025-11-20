@@ -622,4 +622,4 @@ if __name__ == "__main__":
     main()
 
 
-# python /home/thinz/git/sam3/run_sam3.py --csv your_file.csv --cache-dir ~/.cache/sam3_downloads --prompts person animal character
+# python /home/thinz/git/sam3/run_sam3.py --csv your_file.csv --cache-dir ~/.cache/sam3_downloads --mask-cache-dir ./my_mask_cache --prompts person animal character

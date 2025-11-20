@@ -142,6 +142,7 @@ def find_separating_line(
     mask2: np.ndarray,
     use_border_only: bool = True,
     max_border_pixels: int = 2000,
+    target_pixels: int = 921600,  # ~720x1280
 ) -> Tuple[float, float, float, Dict]:
     """
     Find the optimal straight line that separates two masks.
@@ -158,11 +159,12 @@ def find_separating_line(
         mask2: Second binary mask [H, W] or [1, H, W]
         use_border_only: If True, only use border pixels for distance calculations (much faster)
         max_border_pixels: Maximum number of border pixels to use (subsample if more)
+        target_pixels: Target number of pixels for downsampling (default: 921600 ≈ 720x1280)
 
     Returns:
         Tuple of (theta, rho, score, metrics_dict) where:
             - theta: angle of the line in radians (0 to pi)
-            - rho: distance from origin
+            - rho: distance from origin (in original image coordinates)
             - score: optimization score (lower is better - represents total cost)
             - metrics_dict: dictionary with detailed metrics
     """
@@ -171,8 +173,44 @@ def find_separating_line(
     mask2_2d = (mask2.squeeze() > 0.5).astype(np.uint8)
 
     h, w = mask1_2d.shape
+    original_h, original_w = h, w
+
+    # Calculate downsampling factor to target roughly target_pixels
+    current_pixels = h * w
+    if current_pixels > target_pixels:
+        # Calculate scale factor to achieve target pixels while maintaining aspect ratio
+        scale_factor = np.sqrt(target_pixels / current_pixels)
+        new_h = int(h * scale_factor)
+        new_w = int(w * scale_factor)
+
+        # Ensure dimensions are at least 64 pixels
+        new_h = max(new_h, 64)
+        new_w = max(new_w, 64)
+
+        print(
+            f"  Downsampling from {h}x{w} ({current_pixels:,} pixels) to {new_h}x{new_w} ({new_h*new_w:,} pixels)"
+        )
+        print(
+            f"  Scale factor: {scale_factor:.3f} ({current_pixels/target_pixels:.2f}x speedup expected)"
+        )
+
+        # Downsample masks using area interpolation (best for downsampling)
+        mask1_2d = cv2.resize(mask1_2d, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        mask2_2d = cv2.resize(mask2_2d, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+        # Re-binarize after resize
+        mask1_2d = (mask1_2d > 0.5).astype(np.uint8)
+        mask2_2d = (mask2_2d > 0.5).astype(np.uint8)
+
+        h, w = new_h, new_w
+    else:
+        scale_factor = 1.0
+        print(
+            f"  No downsampling needed: {h}x{w} ({current_pixels:,} pixels) <= target ({target_pixels:,} pixels)"
+        )
 
     # Get coordinates of ALL mask pixels (for final metrics)
+    # Convert to float32 for faster computation (sufficient precision for pixel coordinates)
     y1_all, x1_all = np.where(mask1_2d > 0)
     y2_all, x2_all = np.where(mask2_2d > 0)
 
@@ -180,9 +218,15 @@ def find_separating_line(
         print("Warning: One or both masks are empty")
         return 0.0, 0.0, 0.0, {}
 
+    # Convert to float32 for 2x faster computation
+    x1_all = x1_all.astype(np.float32)
+    y1_all = y1_all.astype(np.float32)
+    x2_all = x2_all.astype(np.float32)
+    y2_all = y2_all.astype(np.float32)
+
     # Compute centroids
-    centroid1 = np.array([x1_all.mean(), y1_all.mean()])
-    centroid2 = np.array([x2_all.mean(), y2_all.mean()])
+    centroid1 = np.array([x1_all.mean(), y1_all.mean()], dtype=np.float32)
+    centroid2 = np.array([x2_all.mean(), y2_all.mean()], dtype=np.float32)
 
     # Total number of mask pixels (for final metrics)
     total_pixels1 = len(x1_all)
@@ -206,6 +250,12 @@ def find_separating_line(
         if len(x2) > max_border_pixels:
             indices = np.random.choice(len(x2), max_border_pixels, replace=False)
             x2, y2 = x2[indices], y2[indices]
+
+        # Convert to float32 for faster computation
+        x1 = x1.astype(np.float32)
+        y1 = y1.astype(np.float32)
+        x2 = x2.astype(np.float32)
+        y2 = y2.astype(np.float32)
 
         print(
             f"  Using border pixels: mask1={len(x1)}/{total_pixels1}, mask2={len(x2)}/{total_pixels2}"
@@ -289,9 +339,9 @@ def find_separating_line(
 
     # Try different angles (reduced from 72 to 36 for 2x speedup with minimal accuracy loss)
     num_angles = 36  # Every 5 degrees - good balance of speed and accuracy
-    angles = np.linspace(0, np.pi, num_angles, endpoint=False)
+    angles = np.linspace(0, np.pi, num_angles, endpoint=False, dtype=np.float32)
 
-    # Precompute trigonometric values for all angles
+    # Precompute trigonometric values for all angles (float32 for 2x speedup)
     cos_angles = np.cos(angles)
     sin_angles = np.sin(angles)
 
@@ -307,7 +357,7 @@ def find_separating_line(
     # Try several rho values (reduced from 20 to 10 for 2x speedup)
     num_rho = 10
 
-    # Vectorized evaluation for all angle-rho combinations
+    # FULLY VECTORIZED evaluation for all angle-rho combinations
     for i, theta in enumerate(angles):
         # Generate rho values for this angle
         rhos = np.linspace(rho_mins[i], rho_maxs[i], num_rho)
@@ -316,9 +366,9 @@ def find_separating_line(
         cos_theta = cos_angles[i]
         sin_theta = sin_angles[i]
 
-        # Compute centroid distances (scalar for this theta)
-        dist_centroid1 = centroid1_proj[i] - rhos  # Shape: (num_rho,)
-        dist_centroid2 = centroid2_proj[i] - rhos  # Shape: (num_rho,)
+        # Compute centroid distances (shape: num_rho)
+        dist_centroid1 = centroid1_proj[i] - rhos
+        dist_centroid2 = centroid2_proj[i] - rhos
 
         # Filter out cases where centroids are on same side
         valid_mask = dist_centroid1 * dist_centroid2 < 0
@@ -335,38 +385,54 @@ def find_separating_line(
             x2[:, np.newaxis] * cos_theta + y2[:, np.newaxis] * sin_theta - rhos
         )
 
-        # Vectorized misclassification counting for all valid rhos
-        for j, rho in enumerate(rhos):
+        # VECTORIZED misclassification counting for ALL valid rhos at once
+        # Determine which rhos have centroid1 on positive side (shape: num_rho)
+        centroid1_positive = dist_centroid1 > 0
+
+        # Count misclassifications for all rhos simultaneously
+        # When centroid1 is positive, mask1 should be positive, mask2 negative
+        misclassified1_pos = np.sum(distances1 <= 0, axis=0)  # Shape: (num_rho,)
+        misclassified1_neg = np.sum(distances1 >= 0, axis=0)
+        misclassified2_pos = np.sum(distances2 >= 0, axis=0)
+        misclassified2_neg = np.sum(distances2 <= 0, axis=0)
+
+        # Select the correct misclassification based on centroid orientation
+        misclassified1 = np.where(
+            centroid1_positive, misclassified1_pos, misclassified1_neg
+        )
+        misclassified2 = np.where(
+            centroid1_positive, misclassified2_pos, misclassified2_neg
+        )
+        total_misclassified = misclassified1 + misclassified2
+
+        # Compute minimum distances for all rhos
+        # For each rho, find minimum distance from correctly classified pixels
+        distance_costs = np.full(num_rho, 1e6)
+
+        for j in range(num_rho):
             if not valid_mask[j]:
                 continue
 
-            dist1 = distances1[:, j]
-            dist2 = distances2[:, j]
-
-            if dist_centroid1[j] > 0:
-                misclassified1 = np.sum(dist1 <= 0)
-                misclassified2 = np.sum(dist2 >= 0)
-                correct_dist1 = dist1[dist1 > 0]
-                correct_dist2 = np.abs(dist2[dist2 < 0])
+            if centroid1_positive[j]:
+                correct_dist1 = distances1[distances1[:, j] > 0, j]
+                correct_dist2 = np.abs(distances2[distances2[:, j] < 0, j])
             else:
-                misclassified1 = np.sum(dist1 >= 0)
-                misclassified2 = np.sum(dist2 <= 0)
-                correct_dist1 = np.abs(dist1[dist1 < 0])
-                correct_dist2 = dist2[dist2 > 0]
-
-            total_misclassified = misclassified1 + misclassified2
+                correct_dist1 = np.abs(distances1[distances1[:, j] < 0, j])
+                correct_dist2 = distances2[distances2[:, j] > 0, j]
 
             if len(correct_dist1) > 0 and len(correct_dist2) > 0:
                 min_dist = min(np.min(correct_dist1), np.min(correct_dist2))
-                distance_cost = 1.0 / (min_dist + 0.1)
-            else:
-                distance_cost = 1e6
+                distance_costs[j] = 1.0 / (min_dist + 0.1)
 
-            cost = total_misclassified + 0.001 * distance_cost
+        # Compute costs for all valid rhos at once
+        costs = total_misclassified + 0.001 * distance_costs
+        costs[~valid_mask] = np.inf  # Exclude invalid rhos
 
-            if cost < best_cost:
-                best_cost = cost
-                best_params = [theta, rho]
+        # Find best rho for this angle
+        best_j = np.argmin(costs)
+        if costs[best_j] < best_cost:
+            best_cost = costs[best_j]
+            best_params = [theta, rhos[best_j]]
 
     if best_params is None:
         print("Warning: Could not find initial separating line")
@@ -383,10 +449,29 @@ def find_separating_line(
     theta_opt, rho_opt = result.x
     cost_opt = result.fun
 
-    # Normalize theta to [0, pi)
-    theta_opt = theta_opt % np.pi
+    # Normalize theta to [0, pi) while maintaining the line equation
+    # Line equation: x*cos(theta) + y*sin(theta) = rho
+    # If theta is outside [0, pi), we need to adjust both theta and rho
+    while theta_opt < 0:
+        theta_opt += np.pi
+        rho_opt = -rho_opt
+    while theta_opt >= np.pi:
+        theta_opt -= np.pi
+        rho_opt = -rho_opt
 
-    # Calculate final metrics for reporting
+    # Scale rho back to original image resolution
+    # theta stays the same (angle is resolution-independent)
+    # rho needs to be scaled by 1/scale_factor
+    rho_opt_original = rho_opt / scale_factor
+
+    print(
+        f"  Line at downsampled resolution: theta={np.degrees(theta_opt):.2f}°, rho={rho_opt:.2f}"
+    )
+    print(
+        f"  Line at original resolution: theta={np.degrees(theta_opt):.2f}°, rho={rho_opt_original:.2f}"
+    )
+
+    # Calculate final metrics for reporting (using downsampled coordinates)
     cos_theta = np.cos(theta_opt)
     sin_theta = np.sin(theta_opt)
 
@@ -433,7 +518,8 @@ def find_separating_line(
     )
     print(f"    Min distance to masks: {min_dist:.2f} pixels")
 
-    return theta_opt, rho_opt, cost_opt, metrics
+    # Return line parameters at ORIGINAL resolution
+    return theta_opt, rho_opt_original, cost_opt, metrics
 
 
 def draw_line_on_image(
@@ -545,9 +631,8 @@ def visualize_masks(
     has_masks = len(original_masks) > 0
 
     if show_comparison and has_masks:
-        # Create side-by-side comparison
-        num_cols = 3 if separating_line else 2
-        fig, axes = plt.subplots(1, num_cols, figsize=(10 * num_cols, 8))
+        # Create side-by-side comparison: original masks vs cleaned masks + separating line
+        fig, axes = plt.subplots(1, 2, figsize=(20, 8))
 
         # Original masks
         axes[0].imshow(image)
@@ -558,16 +643,7 @@ def visualize_masks(
             color = colors[i % len(colors)]
             plot_mask(mask_2d, color=color, ax=axes[0])
 
-        # Cleaned masks
-        axes[1].imshow(image)
-        axes[1].set_title("Cleaned Masks (largest component only)", fontsize=14)
-        axes[1].axis("off")
-        for i, mask in enumerate(cleaned_masks):
-            mask_2d = mask.squeeze()
-            color = colors[i % len(colors)]
-            plot_mask(mask_2d, color=color, ax=axes[1])
-
-        # Add separating line visualization if provided
+        # Cleaned masks + separating line
         if separating_line:
             img_with_line = draw_line_on_image(
                 np.array(image),
@@ -576,10 +652,10 @@ def visualize_masks(
                 color=(0, 255, 0),
                 thickness=3,
             )
-            axes[2].imshow(img_with_line)
+            axes[1].imshow(img_with_line)
 
             # Build title with metrics
-            title = f"Separating Line\n(angle={separating_line.get('theta_degrees', 0):.1f}°"
+            title = f"After Cleanup + Separating Line\n(angle={separating_line.get('theta_degrees', 0):.1f}°"
             if separating_line.get("is_default", False):
                 title += ", default)"
             else:
@@ -587,12 +663,21 @@ def visualize_masks(
                 misclassified_pct = metrics.get("misclassified_percent", 0)
                 title += f", misclass={misclassified_pct:.1f}%)"
 
-            axes[2].set_title(title, fontsize=14)
-            axes[2].axis("off")
+            axes[1].set_title(title, fontsize=14)
+            axes[1].axis("off")
             for i, mask in enumerate(cleaned_masks):
                 mask_2d = mask.squeeze()
                 color = colors[i % len(colors)]
-                plot_mask(mask_2d, color=color, ax=axes[2])
+                plot_mask(mask_2d, color=color, ax=axes[1])
+        else:
+            # No separating line, just show cleaned masks
+            axes[1].imshow(image)
+            axes[1].set_title("Cleaned Masks (largest component only)", fontsize=14)
+            axes[1].axis("off")
+            for i, mask in enumerate(cleaned_masks):
+                mask_2d = mask.squeeze()
+                color = colors[i % len(colors)]
+                plot_mask(mask_2d, color=color, ax=axes[1])
 
         plt.tight_layout()
     else:
@@ -670,6 +755,7 @@ def process_masks_for_image(
     local_image_path: str = None,
     output_folder: str = None,
     show_comparison: bool = True,
+    mask_image_folder: str = None,
 ) -> Dict:
     """
     Process loaded masks for further analysis.
@@ -686,6 +772,7 @@ def process_masks_for_image(
         local_image_path: Path to the local cached image file (optional, for visualization)
         output_folder: Folder to save visualizations (optional)
         show_comparison: If True, show both original and cleaned masks side by side
+        mask_image_folder: Folder to save binary mask images (optional)
 
     Returns:
         Dictionary with processed mask information
@@ -818,6 +905,69 @@ def process_masks_for_image(
         else:
             print(f"  Warning: Local image not found at {local_image_path}")
 
+    # Save binary mask images if requested
+    # Save masks after applying the separating line (two masks per image)
+    if mask_image_folder is not None:
+        try:
+            # Generate unique identifier for this image
+            image_hash = hashlib.sha256(image_path.encode()).hexdigest()[:16]
+
+            # Get separating line parameters
+            separating_line = result.get("separating_line", None)
+
+            if separating_line is not None:
+                theta = separating_line["theta"]
+                rho = separating_line["rho"]
+
+                # Get image dimensions
+                if local_image_path and os.path.exists(local_image_path):
+                    image = Image.open(local_image_path)
+                    image_width, image_height = image.size
+                else:
+                    # Use default dimensions if image not available
+                    image_width, image_height = 1024, 1024
+                    print(
+                        f"  Warning: Using default dimensions {image_width}x{image_height} for mask generation"
+                    )
+
+                # Create coordinate grids
+                y_coords, x_coords = np.meshgrid(
+                    np.arange(image_height), np.arange(image_width), indexing="ij"
+                )
+
+                # Calculate signed distance from separating line for all pixels
+                # Line equation: x*cos(theta) + y*sin(theta) = rho
+                cos_theta = np.cos(theta)
+                sin_theta = np.sin(theta)
+                distances = x_coords * cos_theta + y_coords * sin_theta - rho
+
+                # Create two binary masks based on which side of the line pixels are on
+                mask_side1 = (distances > 0).astype(np.uint8) * 255
+                mask_side2 = (distances <= 0).astype(np.uint8) * 255
+
+                # Save both masks
+                for i, binary_mask in enumerate([mask_side1, mask_side2], start=1):
+                    mask_filename = f"{image_hash}_mask_{i}.png"
+                    mask_path = os.path.join(mask_image_folder, mask_filename)
+
+                    # Save using PIL
+                    mask_image = Image.fromarray(binary_mask, mode="L")
+                    mask_image.save(mask_path)
+
+                    print(f"  Saved mask {i} (after separating line) to: {mask_path}")
+
+                result["mask_image_paths"] = [
+                    os.path.join(mask_image_folder, f"{image_hash}_mask_{i}.png")
+                    for i in range(1, 3)
+                ]
+            else:
+                print(
+                    "  Warning: No separating line available, cannot save split masks"
+                )
+
+        except Exception as e:
+            print(f"  Warning: Failed to save mask images: {e}")
+
     return result
 
 
@@ -862,6 +1012,12 @@ def main():
         default=False,
         help="Show side-by-side comparison of original and cleaned masks (default: only show cleaned)",
     )
+    parser.add_argument(
+        "--mask-image-folder",
+        type=str,
+        default=None,
+        help="Output folder for binary mask images (default: no mask image saving)",
+    )
 
     args = parser.parse_args()
 
@@ -882,6 +1038,13 @@ def main():
         os.makedirs(output_folder, exist_ok=True)
         print(f"Visualizations will be saved to: {output_folder}")
         print(f"Show comparison: {args.show_comparison}")
+
+    # Setup mask image folder
+    mask_image_folder = None
+    if args.mask_image_folder is not None:
+        mask_image_folder = args.mask_image_folder
+        os.makedirs(mask_image_folder, exist_ok=True)
+        print(f"Binary mask images will be saved to: {mask_image_folder}")
 
     # Read CSV
     with open(args.csv, "r", encoding="utf-8") as f:
@@ -932,6 +1095,7 @@ def main():
                 local_image_path=local_image_path,
                 output_folder=output_folder,
                 show_comparison=args.show_comparison,
+                mask_image_folder=mask_image_folder,
             )
             all_results.append(result)
 
